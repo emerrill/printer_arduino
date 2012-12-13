@@ -69,6 +69,7 @@ void setup() {
   Serial.println("Start");
   
   printer.begin(75);
+  printer.setTimes(10000, 20); //30000, 2100 defaults
 
 
   WiFly.listen();
