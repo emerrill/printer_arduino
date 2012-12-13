@@ -18,14 +18,15 @@
 
 #define STANDALONE 0
 
-
+// Load Libraries
 #include <Arduino.h>
-#include <Streaming.h>
 #include <SoftwareSerial.h>
-#include <WiFlySerial.h>
-#include <Adafruit_Thermal.h>
 #include <avr/pgmspace.h>
 
+// Outside Libraries
+#include <WiFlySerial.h>
+#include <Adafruit_Thermal.h>
+#include <Streaming.h>
 
 
 // This should define: WIFI_SSID WIFI_PASSPHRASE REMOTE_SERVER REMOTE_PORT REMOTE_URI REMOTE_PASSWORD
@@ -39,7 +40,6 @@
 //Black Wire
 #define PRINTER_GND 8
 
-
 #define WIFLY_RX 11
 #define WIFLY_TX 12
 
@@ -51,11 +51,12 @@ byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED };
 
 
 
-
 Adafruit_Thermal printer(PRINTER_RX, PRINTER_TX);
 WiFlySerial WiFly(WIFLY_RX, WIFLY_TX);
 
 boolean hasPaper = true;
+boolean printerAsleep = false;
+boolean sizeChange = false;
 
 String buffer = String();
 
@@ -68,104 +69,87 @@ void setup() {
   Serial.println("Start");
   
   printer.begin(75);
-  printer.sleep();
 
 
   WiFly.listen();
   WiFly.begin();
-  //Serial << F("Starting WiFly...") <<  WiFly.getLibraryVersion(bufRequest, REQUEST_BUFFER_SIZE) << endl;
-  
-  #if !STANDALONE
-    Serial.println("Association.");
-  #else
-    //printer.println("Print2");
-  #endif
 
+
+  Serial.println(F("Starting WiFi association."));
 
   WiFly.SendCommandSimple("set comm remote 0", "");
   WiFly.setAuthMode( WIFLY_AUTH_WPA2_PSK);
   WiFly.setJoinMode( WIFLY_JOIN_AUTO );
   WiFly.setDHCPMode( WIFLY_DHCP_ON );
   if (!WiFly.setSSID(WIFI_SSID)) {
-    #if !STANDALONE
-      Serial.println("SSID Error");
-    #endif
+    Serial.println(F("SSID Error"));
   }
   if (!WiFly.setPassphrase(WIFI_PASSPHRASE)) {
-    #if !STANDALONE
-      Serial.println("Passphrase Error");
-    #endif
+    Serial.println(F("Passphrase Error"));
   }
   if (!WiFly.join()) {
-    #if !STANDALONE
-      Serial.println("Association failed.");
-    #endif
+    Serial.println(F("Association failed."));
     while (1) {
       // Hang on failure.
       // TODO
     }
   }
 
-  #if !STANDALONE
-    Serial.println("Connected to network.");
-  #endif
+  Serial.println(F("Connected to network."));
   
-  printOne();
+  printAll();
 
 }
 
 
+// Loop
 void loop() {
-  
-  while(Serial.available()) {
-    Serial.read(); 
+
+  int i = 0;
+
+  if (hasPaper) {
+    sleepPrinter();
+    delay(60000);
+  } else {
+    // If we don't have paper, check every second.
+    // Every 60, reconnect so the server gets a status.
+    for (i = 0; i < 60; i++) {
+      delay(1000);
+      if (checkPaper(false)) {
+        delay(10000);
+        break;
+      }
+    }
+    hasPaper = true;
   }
-  
-  while (!Serial.available()) {
-    
-  }
-  while(Serial.available()) {
-    Serial.read(); 
-  }
-  
-  printOne();
+
+  printAll();
 }
 
+// Make a connection to the remote server
 void makeConnection(String extras) {
   WiFly.listen();
   WiFly.closeConnection();
-  if (WiFly.openConnection( REMOTE_SERVER )) {
-    Serial.println("connected");
+  #if defined (REMOTE_IP)
+    if (WiFly.openConnection( REMOTE_IP )) {
+  #else
+    if (WiFly.openConnection( REMOTE_SERVER )) {
+  #endif
+  
+    Serial.println(F("Connected"));
     delay(20);
-    WiFly << "GET /printer.php?key=" << REMOTE_PASSWORD << extras << endl;
-    WiFly << "HOST: " << REMOTE_SERVER << endl << endl;
+    WiFly << F("GET /printer.php?key=") << REMOTE_PASSWORD << extras << F(" HTTP/1.1\r\n");
+    WiFly << F("HOST: ") << REMOTE_SERVER << endl << endl;
   } else {
-    Serial.println("connection failed");
+    Serial.println(F("Connection failed"));
   }
   
   loadResponse();
 }
 
-void printOne() {
-  if (!checkPaper(false)) {
-    printer.sleep();
-    return;
-  }
-  
-  buffer = String();
-  makeConnection("");
-  processResponse();
-  
-  printer.sleep();
-  
-  if (!checkPaper(true)) {
-    return;
-  }
-}
-
+// Print all avalable messages
 void printAll() {
   if (!checkPaper(false)) {
-    printer.sleep();
     return;
   }
   
@@ -174,56 +158,74 @@ void printAll() {
     makeConnection("");
     stat = processResponse();
     if (!checkPaper(true)) {
-      printer.sleep();
       return;
     }
   } while (stat);
-  printer.sleep();
 }
 
+// Check the paper status
 boolean checkPaper(boolean last) {
-  printer.listen();
-  printer.wake();
+  wakePrinter();
   if (!printer.hasPaper()) {
     if (hasPaper == true) {
+      Serial.println(F("No Paper."));
       sendPaper(false, last);
     }
-    //printer.sleep();
+    hasPaper = false;
     return false;
   }
   
   if (hasPaper == false) {
+    Serial.println(F("Paper added."));
     sendPaper(true, false);
   }
-  //printer.sleep();
+  hasPaper = true;
   return true;
 }
 
+// Send the paper status to the server
 void sendPaper(boolean stat ,boolean last) {
   if (stat) {
     makeConnection("&paper=1");
   } else {
     if (last) {
-      makeConnection("&paper=0&missedlast=1");
+      makeConnection("&paper=0&last=1");
     } else {
       makeConnection("&paper=0");
     }
   }
   
+  // Load and whipe the buffer.
+  loadResponse();
+  buffer = String();
 }
 
+// Load a response from the server
 void loadResponse() {
   unsigned long TimeOut = millis() + 40000;
+  char a, b, c = 0;
+  boolean load = false;
   
   while (  TimeOut > millis() && WiFly.isConnectionOpen() ) {
     if (  WiFly.available() > 0 ) {
-      buffer += (char)WiFly.read();
+      if (load) {
+        buffer += (char)WiFly.read();
+      } else {
+        c = b;
+        b = a;
+        a = (char)WiFly.read();
+        if (a == '^' && b == 'S' && c == '^') {
+          load = true;
+          buffer += "^S^";
+        }
+      }
     }
   }
-  
+  Serial.println(buffer);
   WiFly.closeConnection();
 }
 
+// Process a response
 boolean processResponse() {
   if (buffer.lastIndexOf("^E^") == -1) {
     return false;
@@ -237,22 +239,21 @@ boolean processResponse() {
   return true;
 }
 
+// Process/print a block of lines.
 void processBlock(String block) {
-  printer.listen();
-  //printer.wake();
   int pos = 0;
   while ((pos = block.indexOf("|", pos)) != -1) {
     processLine(block.substring(pos, block.indexOf("\n", pos)));
     pos++;
   }
-  
-  //printer.sleep();
-  //WiFly.listen();
 }
 
+// Process and print a formatted line.
 void processLine(String line) {
+  wakePrinter();
+  
   line.trim();
-
+  //Serial.println(line);
   int formatStart = line.indexOf("|");
   int formatEnd = line.indexOf(":");
 
@@ -309,12 +310,15 @@ void processLine(String line) {
           break;
         case '1':
           printer.setSize('S');
+          sizeChange = false;
           break;
         case '2':
           printer.setSize('M');
+          sizeChange = true;
           break;
         case '3':
           printer.setSize('L');
+          sizeChange = true;
           break;
         case '7':
           printer.setLineHeight(28);
@@ -353,23 +357,49 @@ void processLine(String line) {
       }
     }
   }
-  Serial.println(line.substring(formatEnd+1));
   printer.println(line.substring(formatEnd+1));
-  //delay(250);
   
 }
 
+// Set the printer to the listenter, and wake the printer if it's alsleep.
+void wakePrinter() {
+  printer.listen();
+  if (printerAsleep) {
+    Serial.println(F("Wake printer"));
+    Serial.flush();
+    printer.wake();
+    printerAsleep = false;
+  }
+}
 
+// Set the printer to the listenter, and sleep the printer if it's awake.
+
+void sleepPrinter() {
+  printer.listen();
+  if (!printerAsleep) {
+    Serial.println(F("Sleep printer"));
+    Serial.flush();
+    printer.sleep();
+    printerAsleep = true;
+  }
+}
+
+// Set default printer styles
 void setDefault() {
+  wakePrinter();
   printer.online();
   printer.justify('L');
   printer.inverseOff();
   printer.doubleHeightOff();
+  printer.doubleWidthOff();
   printer.setLineHeight(32);
   printer.boldOff();
   printer.underlineOff();
   printer.strikeOff();
   printer.setBarcodeHeight(50);
   printer.upsideDownOff();
-  //setSize('s');
+  if (sizeChange) {
+    printer.setSize('s');
+    sizeChange = false;
+  }
 }
